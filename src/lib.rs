@@ -22,24 +22,25 @@
 //! }
 //! ```
 
-use std::char;
 use std::cmp;
 use std::f32;
 
 extern crate fnv;
 use fnv::FnvHashMap;
 
-static PIXEL_MAP: [[u8; 2]; 4] = [[0x01, 0x08],
-                                   [0x02, 0x10],
-                                   [0x04, 0x20],
-                                   [0x40, 0x80]];
+mod pixel;
+
+use pixel::{colorize_char, Color, Pixel};
+
+static PIXEL_MAP: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 /// A canvas object that can be used to draw to the terminal using Braille characters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Canvas {
-    chars: FnvHashMap<(u16, u16), (u8, char)>,
+    pixels: FnvHashMap<(u16, u16), Pixel>,
     width: u16,
     height: u16,
+    color: Option<Color>,
 }
 
 impl Canvas {
@@ -49,31 +50,50 @@ impl Canvas {
     /// if a pixel is set outside the dimensions.
     pub fn new(width: u32, height: u32) -> Canvas {
         Canvas {
-            chars: FnvHashMap::default(),
+            pixels: FnvHashMap::default(),
             width: (width / 2) as u16,
             height: (height / 4) as u16,
+            color: None,
         }
     }
 
     /// Clears the canvas.
     pub fn clear(&mut self) {
-        self.chars.clear();
+        self.pixels.clear();
+    }
+
+    /// Sets default color on drawing
+    pub fn set_color(&mut self, color: u32) {
+        self.color = Some(Color::from_hex(color));
+    }
+
+    /// Resets default color
+    pub fn reset_color(&mut self) {
+        self.color = None
     }
 
     /// Sets a pixel at the specified coordinates.
     pub fn set(&mut self, x: u32, y: u32) {
         let (row, col) = ((x / 2) as u16, (y / 4) as u16);
-        let a = self.chars.entry((row, col)).or_insert((0,' '));
-        a.0 |= PIXEL_MAP[y as usize % 4][x as usize % 2];
-        a.1 = ' ';
+        let pixel = self.pixels.entry((row, col)).or_default();
+        pixel.set_line(PIXEL_MAP[y as usize % 4][x as usize % 2]);
+        pixel.add_color(self.color);
     }
 
     /// Sets a letter at the specified coordinates.
     pub fn set_char(&mut self, x: u32, y: u32, c: char) {
         let (row, col) = ((x / 2) as u16, (y / 4) as u16);
-        let a = self.chars.entry((row, col)).or_insert((0,' '));
-        a.0 = 0;
-        a.1 = c;
+        let pixel = self.pixels.entry((row, col)).or_default();
+        pixel.set_char(c);
+        pixel.set_color(self.color);
+    }
+
+    /// Deletes a letter at the speified coordinates
+    pub fn unset_char(&mut self, x: u32, y: u32) {
+        let (row, col) = ((x / 2) as u16, (y / 4) as u16);
+        self.pixels
+            .entry((row, col))
+            .and_modify(|pixel| pixel.unset_char());
     }
 
     /// Draws text at the specified coordinates (top-left of the text) up to max_width length
@@ -90,23 +110,24 @@ impl Canvas {
     /// Deletes a pixel at the specified coordinates.
     pub fn unset(&mut self, x: u32, y: u32) {
         let (row, col) = ((x / 2) as u16, (y / 4) as u16);
-        let a = self.chars.entry((row, col)).or_insert((0,' '));
-        a.0 &= !PIXEL_MAP[y as usize % 4][x as usize % 2];
+        self.pixels
+            .entry((row, col))
+            .and_modify(|pixel| pixel.unset_line(PIXEL_MAP[y as usize % 4][x as usize % 2]));
     }
 
     /// Toggles a pixel at the specified coordinates.
     pub fn toggle(&mut self, x: u32, y: u32) {
         let (row, col) = ((x / 2) as u16, (y / 4) as u16);
-        let a = self.chars.entry((row, col)).or_insert((0,' '));
-        a.0 ^= PIXEL_MAP[y as usize % 4][x as usize % 2];
+        self.pixels
+            .entry((row, col))
+            .and_modify(|pixel| pixel.toggle_line(PIXEL_MAP[y as usize % 4][x as usize % 2]));
     }
 
     /// Detects whether the pixel at the given coordinates is set.
     pub fn get(&self, x: u32, y: u32) -> bool {
         let (row, col) = ((x / 2) as u16, (y / 4) as u16);
-        self.chars.get(&(row, col)).map_or(false, |a| {
-            let dot_index = PIXEL_MAP[y as usize % 4][x as usize % 2];
-            a.0 & dot_index != 0
+        self.pixels.get(&(row, col)).map_or(false, |pixel| {
+            pixel.get_line(PIXEL_MAP[y as usize % 4][x as usize % 2])
         })
     }
 
@@ -117,21 +138,27 @@ impl Canvas {
     pub fn rows(&self) -> Vec<String> {
         let mut maxrow = self.width;
         let mut maxcol = self.height;
-        for &(x, y) in self.chars.keys() {
-            if x > maxrow {maxrow = x;}
-            if y > maxcol {maxcol = y;}
+        for &(x, y) in self.pixels.keys() {
+            if x > maxrow {
+                maxrow = x;
+            }
+            if y > maxcol {
+                maxcol = y;
+            }
         }
 
         let mut result = Vec::with_capacity(maxcol as usize + 1);
         for y in 0..=maxcol {
             let mut row = String::with_capacity(maxrow as usize + 1);
+            let mut prev_color: Option<Color> = None;
             for x in 0..=maxrow {
-                let cell = self.chars.get(&(x, y)).cloned().unwrap_or((0,' '));
-                row.push(if cell.0 == 0 {
-                    cell.1
-                } else {
-                    char::from_u32(0x2800 + cell.0 as u32).unwrap()
-                })
+                let cell = self.pixels.get(&(x, y)).cloned().unwrap_or_default();
+                let (s, color) = cell.get_char(prev_color);
+                row.extend(s.chars());
+                prev_color = color;
+            }
+            if prev_color.is_some() {
+                row.extend(colorize_char(None, None, true).chars());
             }
             result.push(row);
         }
@@ -233,8 +260,8 @@ impl Turtle {
 
     /// Moves the `Turtle` forward by `dist` steps.
     pub fn forward(&mut self, dist: f32) {
-        let x = self.x + degrees_to_radians(self.rotation).cos()*dist;
-        let y = self.y + degrees_to_radians(self.rotation).sin()*dist;
+        let x = self.x + degrees_to_radians(self.rotation).cos() * dist;
+        let y = self.y + degrees_to_radians(self.rotation).sin() * dist;
         self.teleport(x, y);
     }
 
@@ -249,10 +276,12 @@ impl Turtle {
     /// brush is down.
     pub fn teleport(&mut self, x: f32, y: f32) {
         if self.brush {
-            self.cvs.line(cmp::max(0, self.x.round() as i32) as u32,
-                          cmp::max(0, self.y.round() as i32) as u32,
-                          cmp::max(0, x.round() as i32) as u32,
-                          cmp::max(0, y.round() as i32) as u32);
+            self.cvs.line(
+                cmp::max(0, self.x.round() as i32) as u32,
+                cmp::max(0, self.y.round() as i32) as u32,
+                cmp::max(0, x.round() as i32) as u32,
+                cmp::max(0, y.round() as i32) as u32,
+            );
         }
 
         self.x = x;
